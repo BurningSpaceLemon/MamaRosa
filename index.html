@@ -1746,6 +1746,168 @@ function escAttr(v){return String(v??'').replace(/\\/g,'\\\\').replace(/'/g,"\\'
 // Modals schließen, wenn auf den abgedunkelten Bereich getippt wird.
 ['modal-stock','modal-recipe'].forEach(id=>document.getElementById(id).addEventListener('click',e=>{if(e.target===e.currentTarget)e.currentTarget.classList.remove('open')}));
 
+
+
+function quickMealScore(recipe) {
+  const scale = state.persons / 2;
+  const ings = recipe.ingredients || [];
+  if (!ings.length) return { score: -1, have: 0, total: 0, missing: [] };
+  let have = 0;
+  const missing = [];
+  for (const ing of ings) {
+    const need = Number(ing.qty || 0) * scale;
+    const got = Number(state.pantry[ing.name]?.qty || 0);
+    // If qty isn't known (0), treat as missing; if need is 0, ignore.
+    if (need > 0 && got >= need) have++;
+    else if (need > 0) missing.push(ing.name);
+  }
+  const total = ings.filter(i => Number(i.qty || 0) * scale > 0).length || ings.length;
+  const ratio = have / Math.max(1, total);
+  // Small bias toward fewer missing items and fewer total ingredients (faster).
+  const simplicity = 1 / Math.max(1, total);
+  const randomness = Math.random() * 0.4;
+  const score = ratio * 10 + simplicity * 2 - missing.length * 0.15 + randomness;
+  return { score, have, total, missing };
+}
+
+function suggestQuickMeal(forceRandom=false) {
+  const out = document.getElementById('quick-meal-result');
+  if (!out) return;
+
+  const pool = allRecipesUnique();
+  if (!pool.length) {
+    out.innerHTML = '<div class="empty-inline">Noch keine Gerichte im Katalog.</div>';
+    return;
+  }
+
+  let pick = null;
+  let meta = null;
+
+  if (forceRandom) {
+    pick = pool[Math.floor(Math.random() * pool.length)];
+    meta = quickMealScore(pick);
+  } else {
+    // Prefer recipes that use what's available.
+    const top = pool
+      .map(r => ({ r, m: quickMealScore(r) }))
+      .filter(x => x.m.score >= 0)
+      .sort((a,b) => b.m.score - a.m.score)
+      .slice(0, 25);
+
+    if (!top.length) {
+      pick = pool[Math.floor(Math.random() * pool.length)];
+      meta = quickMealScore(pick);
+    } else {
+      // Weighted random among the top results to keep it from feeling repetitive.
+      const weights = top.map((x,i) => Math.max(0.2, x.m.score) * (1 - i*0.02));
+      const sum = weights.reduce((a,b)=>a+b,0);
+      let t = Math.random() * sum;
+      let idx = 0;
+      for (; idx < weights.length; idx++) { t -= weights[idx]; if (t <= 0) break; }
+      const chosen = top[Math.min(idx, top.length-1)];
+      pick = chosen.r;
+      meta = chosen.m;
+    }
+  }
+
+  if (!pick) return;
+
+  const missingPreview = (meta.missing || []).slice(0, 6);
+  const missingText = missingPreview.length
+    ? `Fehlt evtl.: <strong>${missingPreview.map(escapeHtml).join(', ')}</strong>${meta.missing.length > missingPreview.length ? ' …' : ''}`
+    : '<strong>Alles da</strong> – los geht’s!';
+
+  out.innerHTML = `
+    <div class="card" style="padding:14px 14px; margin:0; border:1px solid var(--green-light);">
+      <div style="display:flex; align-items:center; gap:12px;">
+        <div class="recipe-hero-icon" style="width:46px;height:46px;border-radius:16px;">${pick.emoji || '🍽️'}</div>
+        <div style="flex:1; min-width:0;">
+          <div style="font-weight:900; font-size:15px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${escapeHtml(pick.name)}</div>
+          <div style="color:var(--text-soft); font-size:12px; margin-top:2px;">${escapeHtml(pick.cuisineName || pick.cuisine || 'International')} · ${meta.have}/${meta.total} Zutaten vorhanden</div>
+        </div>
+      </div>
+      <div style="margin-top:10px; color:var(--text-soft); font-size:12px; line-height:1.45;">
+        ${missingText}
+      </div>
+      <div style="display:flex; gap:8px; margin-top:12px;">
+        <button class="btn btn-primary btn-sm" style="flex:1;" onclick="openQuickMealRecipe('${escAttr(pick.id)}')">📖 Rezept öffnen</button>
+        <button class="btn btn-outline btn-sm" style="flex:1;" onclick="addQuickMealToPlan('${escAttr(pick.id)}')">📅 In Plan</button>
+      </div>
+    </div>
+  `;
+}
+
+function openQuickMealRecipe(id) {
+  const r = allRecipesUnique().find(x => x.id === id);
+  if (!r) return;
+  // Show in the existing cook recipe sheet, without marking as cooked.
+  currentCookEntry = { day: null, cooked: true, recipe: r };
+  showCookRecipePreview(r);
+}
+
+function showCookRecipePreview(recipe) {
+  // Reuse the cook recipe modal without enabling cooked flow.
+  const scale = state.persons / 2;
+  const ingredients = recipe.ingredients || [];
+  const missing = ingredients.filter(ing => {
+    const needed = Number(ing.qty || 0) * scale;
+    const have = Number(state.pantry[ing.name]?.qty || 0);
+    return have < needed;
+  });
+  const steps = getRecipeSteps(recipe);
+  const estimatedMinutes = recipe.minutes || Math.min(75, Math.max(20, 15 + ingredients.length * 4));
+
+  document.getElementById('cook-recipe-detail').innerHTML = `
+    <div class="recipe-hero">
+      <div class="recipe-hero-icon">${recipe.emoji || '🍽️'}</div>
+      <div class="recipe-hero-copy">
+        <h2>${escapeHtml(recipe.name || 'Gericht')}</h2>
+        <p>${escapeHtml(recipe.cuisine || recipe.cuisineName || 'International')} · ${(recipe.tags || []).map(escapeHtml).join(', ')}</p>
+      </div>
+    </div>
+    <div class="recipe-facts">
+      <span class="recipe-fact">👥 ${state.persons} ${state.persons === 1 ? 'Person' : 'Personen'}</span>
+      <span class="recipe-fact">⏱ ca. ${estimatedMinutes} Min.</span>
+      <span class="recipe-fact">🥣 ${ingredients.length} Zutaten</span>
+    </div>
+    <div class="recipe-section-heading"><span>Zutaten</span><span style="font-size:10px;color:var(--text-lighter);text-transform:none;letter-spacing:0">auf ${state.persons} Personen skaliert</span></div>
+    <div class="card" style="padding:6px 14px;margin-bottom:0;">
+      ${ingredients.map(ing => {
+        const needed = Number(ing.qty || 0) * scale;
+        const have = Number(state.pantry[ing.name]?.qty || 0);
+        const enough = have >= needed;
+        return `<div class="ingredient-line"><span class="ingredient-status ${enough ? 'have' : 'missing'}">${enough ? '✓' : '!'}</span><span class="ingredient-line-name">${escapeHtml(ing.name)}</span><span class="ingredient-line-qty">${formatQty(needed)} ${escapeHtml(ing.unit || 'Stück')}</span></div>`;
+      }).join('') || '<div class="empty-inline">Für dieses Gericht sind noch keine Zutaten hinterlegt.</div>'}
+    </div>
+    ${missing.length ? `<div class="recipe-warning"><strong>${missing.length} ${missing.length === 1 ? 'Zutat fehlt' : 'Zutaten fehlen'} laut Vorratsschrank:</strong> ${missing.map(i => escapeHtml(i.name)).join(', ')}.</div>` : ''}
+    <div class="recipe-section-heading"><span>Zubereitung</span></div>
+    <div class="card" style="padding:10px 14px;margin-bottom:0;">
+      ${steps.map((step, index) => `<div class="cooking-step"><span class="cooking-step-number">${index + 1}</span><p>${escapeHtml(step)}</p></div>`).join('')}
+    </div>
+    <div class="recipe-sticky-action">
+      <button class="btn btn-outline" onclick="closeCookRecipe()">Zurück</button>
+    </div>`;
+
+  document.getElementById('modal-cookrecipe').classList.add('open');
+}
+
+function addQuickMealToPlan(id) {
+  const r = allRecipesUnique().find(x => x.id === id);
+  if (!r) return;
+  // Add to the next active day that is not in plan, else first active day.
+  const days = (state.activeDays || []).slice().sort((a,b)=>a-b);
+  const used = new Set((state.weekPlan || []).map(x => x.day));
+  let day = days.find(d => !used.has(d));
+  if (day === undefined) day = days[0] ?? 0;
+  let entry = state.weekPlan.find(x => x.day === day);
+  if (entry) entry.recipe = r;
+  else state.weekPlan.push({ day, recipe: r, cooked: false });
+  state.weekPlan.sort((a,b)=>a.day-b.day);
+  save();
+  // jump user to plan so they see it
+  goTo('plan');
+  renderWeekPlanList();
+}
 migrateState();
 buildWorldCatalog();
 renderAllV2();
